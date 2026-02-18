@@ -6,8 +6,13 @@ import zoneinfo
 import datetime
 from typing import Optional, Literal
 from dataclasses import dataclass, field
+from urllib.parse import urlparse, parse_qs, unquote
 
 import requests
+
+
+class AuthenticationError(Exception):
+    """Raised when authentication with Thames Water fails."""
 
 
 @dataclass
@@ -26,7 +31,7 @@ class MeterUsage:
     TargetUsage: float
     AverageUsage: float
     ActualUsage: float
-    MyUsage: str  # so far have only seen 'NA'
+    MyUsage: Optional[str]  # so far have only seen 'NA' or None
     AverageUsagePerPerson: float
     IsMO365Customer: bool
     IsMOPartialCustomer: bool
@@ -126,8 +131,14 @@ class ThamesWater:
         r = self.s.get(url, headers=headers, params=params)
         r.raise_for_status()
 
-        confirmed_signup_structured_response = {item.split('=')[0]: item.split('=')[1] for item in r.url.split('#')[1].split('&')}
-        return confirmed_signup_structured_response['code']
+        parsed = urlparse(r.url)
+        fragment_params = parse_qs(parsed.fragment)
+        if 'code' not in fragment_params:
+            raise AuthenticationError(
+                f"Authentication failed: 'code' not found in redirect URL fragment. "
+                f"URL was: {r.url!r}"
+            )
+        return fragment_params['code'][0]
     
     def _get_oauth2_code_b2c_1_tw_website_signin(self, confirmation_code: str):
         url = 'https://login.thameswater.co.uk/identity.thameswater.co.uk/b2c_1_tw_website_signin/oauth2/v2.0/token'
@@ -197,7 +208,7 @@ class ThamesWater:
         r.raise_for_status()
 
     def _authenticate(
-        self, 
+        self,
         email: str,
         password: str,
     ):
@@ -208,13 +219,40 @@ class ThamesWater:
         self._get_oauth2_code_b2c_1_tw_website_signin(confirmation_code)
         self._refresh_oauth2_token_b2c_1_tw_website_signin()
 
-        self.s.get('https://myaccount.thameswater.co.uk/mydashboard')
-        self.s.get(f'https://myaccount.thameswater.co.uk/mydashboard/my-meters-usage?contractAccountNumber={self.account_number}')
-        r = self.s.get('https://myaccount.thameswater.co.uk/twservice/Account/SignIn?useremail=')
-        state = r.url.split('&state=')[1].split('&nonce=')[0].replace('%3d', '=')
-        id_token = r.text.split("id='id_token' value='")[1].split("'/>")[0]
-        self.s.get(r.url)
-        self._login(state, id_token)
+        id_token = self.oauth_request_tokens['id_token']
+
+        # First POST to /login with the id_token to establish a session on
+        # myaccount.thameswater.co.uk. The server redirects through
+        # /twservice/Account/SignIn and then to a second B2C authorize page
+        # that carries a new state value and contains a fresh id_token in the
+        # page body.
+        r = self.s.post(
+            'https://myaccount.thameswater.co.uk/login',
+            data={'id_token': id_token, 'state': ''},
+            headers={
+                'user-agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/132.0.0.0 Safari/537.36',
+                'content-type': 'application/x-www-form-urlencoded',
+            },
+        )
+        r.raise_for_status()
+
+        parsed = urlparse(r.url)
+        query_params = parse_qs(parsed.query)
+        if 'state' not in query_params:
+            raise AuthenticationError(
+                f"Authentication failed: 'state' not found in redirect URL after first login POST. "
+                f"URL was: {r.url!r}"
+            )
+        state = unquote(query_params['state'][0])
+        if "id='id_token' value='" not in r.text:
+            raise AuthenticationError(
+                "Authentication failed: 'id_token' not found in page after first login POST."
+            )
+        new_id_token = r.text.split("id='id_token' value='")[1].split("'/>")[0]
+
+        # Second POST to /login with the state and id_token from the redirect page
+        # to complete the session establishment.
+        self._login(state, new_id_token)
         self.s.cookies.set(name='b2cAuthenticated', value='true')
 
     def get_meter_usage(
@@ -249,7 +287,7 @@ class ThamesWater:
         r.raise_for_status()
 
         data = r.json()
-        data["Lines"] = [Line(**line) for line in data["Lines"]]
+        data["Lines"] = [Line(**line) for line in data["Lines"] or []]
         return MeterUsage(**data)
     
 
